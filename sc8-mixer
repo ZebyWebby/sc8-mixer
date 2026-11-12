@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""SC8 Mixer — a tiny Qt control panel for the Fifine SC8 on Linux.
+
+Controls the SC8's *hardware* volumes (the ones Fifine Genie sets on Windows)
+through amixer, plus a shortcut to make Game the default output.
+"""
+import re
+import subprocess
+import sys
+
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtWidgets import (
+    QApplication, QCheckBox, QGridLayout, QHBoxLayout, QLabel,
+    QMessageBox, QPushButton, QSlider, QVBoxLayout, QWidget,
+)
+
+CARD = "Chat"  # ALSA card id of the SC8
+GAME_SINK = "alsa_output.usb-MV-SILICON_fifine_Chat_20190808-00.analog-stereo"
+CHAT_SINK = "fifine_sc8_output_2"
+
+# label, amixer control, kind ("p" = playback, "c" = capture)
+CHANNELS = [
+    ("🎮  Game", "PCM,0", "p"),
+    ("💬  Chat", "PCM,1", "p"),
+    ("🎙  Mic",  "Mic,0", "c"),
+]
+
+
+def run(*args):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def get_state(control):
+    """Return (percent, on) for an amixer control, or None if unavailable."""
+    r = run("amixer", "-c", CARD, "sget", control)
+    if not r or r.returncode != 0:
+        return None
+    m = re.search(r"\[(\d+)%\](?:.*?\[(on|off)\])?", r.stdout)
+    if not m:
+        return None
+    return int(m.group(1)), (m.group(2) or "on") == "on"
+
+
+def set_volume(control, pct):
+    run("amixer", "-q", "-c", CARD, "sset", control, f"{pct}%")
+
+
+def set_switch(control, kind, on):
+    word = ("unmute" if kind == "p" else "cap") if on else ("mute" if kind == "p" else "nocap")
+    run("amixer", "-q", "-c", CARD, "sset", control, word)
+
+
+class ChannelRow:
+    def __init__(self, grid, row, label, control, kind):
+        self.control, self.kind = control, kind
+        self.name = QLabel(label)
+        self.name.setStyleSheet("font-size: 15px; font-weight: 600;")
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(0, 100)
+        self.slider.setMinimumWidth(260)
+        self.value = QLabel("—")
+        self.value.setFixedWidth(44)
+        self.value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.toggle = QCheckBox("On")
+
+        grid.addWidget(self.name, row, 0)
+        grid.addWidget(self.slider, row, 1)
+        grid.addWidget(self.value, row, 2)
+        grid.addWidget(self.toggle, row, 3)
+
+        self.slider.valueChanged.connect(self._on_slide)
+        self.toggle.toggled.connect(lambda on: set_switch(self.control, self.kind, on))
+
+    def _on_slide(self, v):
+        self.value.setText(f"{v}%")
+        set_volume(self.control, v)
+
+    def refresh(self):
+        state = get_state(self.control)
+        enabled = state is not None
+        for w in (self.slider, self.toggle):
+            w.setEnabled(enabled)
+        if not enabled:
+            self.value.setText("—")
+            return
+        pct, on = state
+        if not self.slider.isSliderDown():
+            self.slider.blockSignals(True)
+            self.slider.setValue(pct)
+            self.slider.blockSignals(False)
+            self.value.setText(f"{pct}%")
+        self.toggle.blockSignals(True)
+        self.toggle.setChecked(on)
+        self.toggle.blockSignals(False)
+
+
+class Mixer(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("SC8 Mixer")
+
+        self.status = QLabel()
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(14)
+        self.rows = [ChannelRow(grid, i, *c) for i, c in enumerate(CHANNELS)]
+
+        default_btn = QPushButton("Use Game as default output")
+        default_btn.clicked.connect(self.make_game_default)
+        save_btn = QPushButton("Save levels (survive reboot)")
+        save_btn.clicked.connect(self.save)
+
+        buttons = QHBoxLayout()
+        buttons.addWidget(default_btn)
+        buttons.addWidget(save_btn)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.status)
+        layout.addLayout(grid)
+        layout.addSpacing(6)
+        layout.addLayout(buttons)
+
+        self.timer = QTimer(self, interval=1500, timeout=self.refresh)
+        self.timer.start()
+        self.refresh()
+
+    def refresh(self):
+        for r in self.rows:
+            r.refresh()
+        ok = get_state("PCM,0") is not None
+        self.status.setText("● SC8 connected" if ok else "○ SC8 not found — is it plugged in?")
+        self.status.setStyleSheet(f"color: {'#2e9e5b' if ok else '#c0392b'};")
+
+    def make_game_default(self):
+        r = run("pactl", "set-default-sink", GAME_SINK)
+        if r and r.returncode == 0:
+            self.status.setText("✔ Game is now the default output")
+        else:
+            QMessageBox.warning(self, "SC8 Mixer", "Couldn't set the default output.")
+
+    def save(self):
+        r = run("pkexec", "alsactl", "store")
+        if r and r.returncode == 0:
+            self.status.setText("✔ Levels saved — they'll be restored on boot")
+        else:
+            QMessageBox.warning(self, "SC8 Mixer", "Saving was cancelled or failed.")
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setApplicationName("SC8 Mixer")
+    w = Mixer()
+    w.show()
+    sys.exit(app.exec_())

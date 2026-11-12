@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=SC8 Mixer
+Comment=Game / Chat / Mic levels for the Fifine SC8
+Exec=sc8-mixer
+Icon=audio-card
+Categories=AudioVideo;Audio;Mixer;
